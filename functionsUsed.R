@@ -10,6 +10,33 @@ library(BiocParallel)
 library(reshape2)
 library(ggrepel)
 library(fgsea)
+library(clusterProfiler)
+
+# COLOR SCHEMES
+PHST4COLOR <- c("#ffc2db", '#FE2C8B', '#fcb6ac', '#ff6e59')
+PHST3COLOR <- c("#FE2B8B", "#FC8575", "lightgray" )
+
+insert_at <- function(l, i, x) {
+  if (i > length(l)) {
+    stop("Must insert within array")
+  }
+  return(c(l[1:i-1], x, l[(i):length(l)]))
+}
+
+
+#' create_annotation
+#' @param x char array of ensembl_gene_ids to query
+#' @return the annotation dataframe
+create_annotation <- function(x) {
+  library(biomaRt)
+  mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+  generef <- getBM(filters = "ensembl_gene_id", 
+                   attributes = c("ensembl_gene_id", "hgnc_symbol", 
+                                  "description", "gene_biotype"),
+                   values = x, 
+                   mart = mart)
+  return(generef)
+}
 
 scatter_corr <- function(v1, 
                          v2, 
@@ -106,35 +133,34 @@ personalis_boxplot <- function(data,
   return(p1)
 }
 
-plotDists = function (vsd.obj) {
-  sampleDists <- dist(t(assay(vsd.obj)))
-
-  sampleDistMatrix <- as.matrix( sampleDists )
-  rownames(sampleDistMatrix) <- paste( vsd.obj$celltype )
-
-  # colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+plotDists = function (obj, coi=NULL) {
+  require(DESeq2)
+  require(tidyverse)
+  require(pheatmap)
+  require(viridis)
+  obj.vst <- t(assay(vst(obj,blind=T)))
+  sampleDists <- dist(obj.vst)
   colors <- rev(viridis_pal(option = "D")(255))
-  print(pheatmap(sampleDistMatrix,
+  if (!is.null(coi)) attributes(sampleDists)$Labels <- obj@colData[[coi]]
+  print(pheatmap(sampleDists |> as.matrix(),
                  clustering_distance_rows = sampleDists,
                  clustering_distance_cols = sampleDists,
                  col = colors,
                  border_color = NA))
 }
 
+
 # joshR's modified version which uses prcomp instead of the DESeq2 implemention of pca
-name.plotPCA = function (obj, topn = NULL, coi="condition", label=T) {
+name.plotPCA = function (obj, topn = NULL, coi="condition", label=F) {
   if (length(coi) != 1 && length(coi) != 2) {
     print("coi needs to be either a column name in vsd.obj coldata, or 2 of them")
     return(NULL)
   }
   targets <- as.data.frame(obj@colData)
+  a <- assay(vst(obj, blind=T))
   if (!is.null(topn)) {
-    a <- assay(obj)
     a <- head(a[order(rowVars(a), decreasing = T),], n=topn) #use topn genes
-  } else {
-    a <- assay(obj)
-    pca <- prcomp(t(a)) #use all genes
-  }
+  } 
   pca <- prcomp(t(a))
   pca.df <- as.data.frame(pca$x[,c(1,2)]) #first 2 columns are PC1 and PC2
   if (length(coi) > 1) {
@@ -173,16 +199,91 @@ name.plotPCA = function (obj, topn = NULL, coi="condition", label=T) {
   return(p)
 }
 
-write.pcatable = function(obj, topn=3000) {
-  a <- assay(obj)
+#' write.pcatable
+#'
+#' @param obj dds object after DESeq2 run 
+#' @param geneannot_obj gene annotation dataframe
+#' @param geneannot_col column name for merging
+#' @param topn integer to take the top n slice of the top variable genes before prcomp()
+#' @param filename file name to use for outputting the eigenvalues
+#'
+#' @return NULL
+write.pcatable = function(obj, geneannot_obj=NULL, geneannot_col=NULL, topn=3000, filename=NULL) {
+  require(data.table)
+  a <- assay(vst(obj,blind=T))
   a <- head(a[order(rowVars(a), decreasing = T),], n=topn) #use topn genes
   pca <- prcomp(t(a))
   pca.rot <- pca$rotation
-  pca.rot <- merge(annotation, pca.rot[,1:5], by.x="Gene.stable.ID", by.y = "row.names")
-  rownames(pca.rot) <- pca.rot$Gene.stable.ID
-  pca.rot <- pca.rot[,-1]
+  if (!is.null(geneannot_obj)) {
+    rownames(pca.rot) <- gsub("\\.[0-9]+", "",rownames(pca.rot))
+    pca.rot <- merge(geneannot_obj, 
+                     pca.rot[,1:5], 
+                     by.x=geneannot_col, 
+                     by.y = "row.names")
+  }
   pca.rot <- pca.rot[order(abs(pca.rot[,grep("PC1", colnames(pca.rot))]), decreasing = T),]
-  write.table(pca.rot, file="pca_rotations.tsv", quote = F, sep = "\t", col.names = NA)
+  if (is.null(filename)) {
+    fwrite(pca.rot, file="pca_rotations.tsv", quote = F, sep = "\t")
+  } else {
+    fwrite(pca.rot, file=filename, quote = F, sep = "\t")
+  }
+}
+
+#' plotUMAP
+#'
+#' @return ggplot
+#' @export
+#'
+#' @examples
+plotUMAP <- function(obj, topn = NULL, coi="condition", label=F) {
+  require(ggplot2)
+  require(umap)
+  
+  set.seed(777)
+  
+  if (length(coi) != 1 && length(coi) != 2) {
+    print("coi needs to be either a column name in vsd.obj coldata, or 2 of them")
+    return(NULL)
+  }
+  targets <- as.data.frame(obj@colData)
+  a <- assay(vst(obj, blind=T))
+  if (!is.null(topn)) {
+    a <- head(a[order(rowVars(a), decreasing = T),], n=topn) #use topn genes
+  } 
+  umap <- umap(t(a))
+  umap.df <- as.data.frame(umap$layout[,c(1,2)]) #first 2 columns are PC1 and PC2
+  colnames(umap.df) <- c("UMAP_1", "UMAP_2")
+  if (length(coi) > 1) {
+    if (!is.factor(targets[,coi[1]])) {
+      targets[,coi[1]] <- as.factor(targets[,coi[1]])
+    }
+    if (!is.factor(targets[,coi[2]])) {
+      targets[,coi[2]] <- as.factor(targets[,coi[2]])
+    }
+    umap.df[,coi[1]] <- targets[,coi[1]]
+    umap.df[,coi[2]] <- targets[,coi[2]]
+  } else {
+    umap.df[,coi] <- targets[,coi]
+  }
+  umap.df$samples <- rownames(umap.df)
+  if (length(coi) > 1) {
+    p <- ggplot(umap.df, aes(x = UMAP_1, y = UMAP_2)) +
+      geom_point(aes(color=.data[[coi[1]]], shape=.data[[coi[1]]] ), size=3) +
+      xlab('UMAP_1') +
+      xlab('UMAP_2') +
+      theme_bw()
+  } else {
+    p <- ggplot(umap.df, aes(x = UMAP_1, y = UMAP_2)) +
+      geom_point(aes(color=.data[[coi]] ), size=3) +
+      xlab('UMAP_1') +
+      xlab('UMAP_2') +
+      theme_bw()
+  }
+  if (label) {
+    p <- p + geom_text_repel(aes_string(label = "samples"),
+                             color = "black")
+  }
+  return(p)
 }
 
 # for plotting tsne (using input perplexity)
@@ -231,21 +332,25 @@ plotTSNE = function (obj, perp, coi) {
 #' @param quantile_smoothing whether to set value in the heatmap higher than the 99th percentile or lower \
 #' than the 1st percentile to the 99th or 1st, respectively
 #' @param write_heatmap_txt whether to print a tsv of the heatmap info
+#' @param annotation if the vsd.obj is labeled with ensembl ids (or another id) \
+#  then this dataframe will be left_join()'d with vsd.obj 
 #'
-#' @return
+#' @return the pheatmap obj
 plotHeatmap <- function (vsd.obj, 
                          with_labels=F,
+                         annotation=NULL,
                          TOPN=1000, 
                          quantile_smoothing=T, 
                          write_heatmap_txt=F,
+                         outdir=NULL,
                          targets=NULL) {
   brewer_palette <- "RdBu"
   ramp <- colorRampPalette(brewer.pal(11, brewer_palette))# Ramp the color in order to get the scale.
   mr <- ramp(256)[256:1]
-  stabilized <- assay(vsd.obj)
-  rv <- rowVars(stabilized)# calculate the variances by row(gene) to find out which genes are the most variable across the samples.
-  select <- order(rv, decreasing=T)[seq_len(TOPN)]# order matrix from top to bottom by the rowVars vairable, take the top 1000 most variable
-  M <- stabilized[select,]
+  vsd.obj.assay <- assay(vsd.obj)
+  rv <- rowVars(vsd.obj.assay)# calculate the variances by row(gene) to find out which genes are the most variable across the samples.
+  topselected <- order(rv, decreasing=T)[seq_len(TOPN)]# order matrix from top to bottom by the rowVars vairable, take the top 1000 most variable
+  M <- vsd.obj.assay[topselected,]
   M <- M - rowMeans(M, na.rm=T)# subtract out the means from each row, leaving the variances for each gene.
 
   allquantile <- quantile(as.matrix(M), 0:100/100)
@@ -255,12 +360,20 @@ plotHeatmap <- function (vsd.obj,
   M[M < quantile_1st] <- quantile_1st
 
   # annotate the matrix and remove miscellaneous columns
-  annot_M <- left_join(cbind(rownames(M),as_tibble(M)), annotation, by = c("rownames(M)" = "Gene.name"))
+  if (!is.null(annotation)) {
+    annot_M <- M %>% as.data.frame() %>%
+      rownames_to_column('ensembl_gene_id') %>%
+      mutate(ensembl_gene_id=gsub("\\.[0-9]+", "",ensembl_gene_id)) %>%
+      left_join(annotation, 
+                by = 'ensembl_gene_id') %>%
+      mutate('gene_id' = ifelse(hgnc_symbol == '' | duplicated(hgnc_symbol) | is.na(hgnc_symbol),
+                                ensembl_gene_id,
+                                hgnc_symbol)) %>%
+      column_to_rownames('gene_id') %>%
+      dplyr::select(colnames(M))
+  } 
   #added the next 7 lines of code to avoid duplicate rownames errors
-  colnames(annot_M)[1] <- "Gene.name"
-  annot_M <- annot_M[!duplicated(annot_M$Gene.name),]
-  rownames(annot_M) <- annot_M$Gene.name
-  annot_M <- annot_M[, !(colnames(annot_M) %in% c("rownames(M)", "Gene.name", "Gene.description", "Gene.type", "Gene.stable.ID"))]
+
   # # re-color each of the conditions / treatments
   # ann_colors <-  brewer.pal(length(unique(vsd.obj$condition)), "Paired")
   # names(ann_colors) <- unique(vsd.obj$condition)
@@ -281,9 +394,10 @@ plotHeatmap <- function (vsd.obj,
                            fontsize_col = 12, cellheight = 1)
   }
   if (write_heatmap_txt) {
-    write.table(annot_M, paste0("QCheatmap_",TOPN,"genes.txt"), quote = F, sep = "\t", col.names = NA)
+    if (is.null(outdir)) stop("must supply outdir if text file is requested")
+    write.table(annot_M, file.path(outdir,paste0("QCheatmap_",TOPN,"genes.txt")), quote = F, sep = "\t", col.names = NA)
   }
-  print(my_heatmap)
+  return(my_heatmap)
 }
 
 apply_annotation <- function (res, 
@@ -320,14 +434,14 @@ generate_DEseq <- function (my_data, groups) {
   return(dds)
 }
 
-#' run_DE **untested**
+#' run_DE **working**
 #' 
 #' needs to be fixed so that only samples from the current comparison are 
 #' ... outputted to tables
 #' 
 #' 
 #' @description Prints tables of DEGs
-#' @param dds a dds object where DESeq2() was already run
+#' @param dds a dds object where DESeq2() was already run, must contain ONLY 2 factor levels for the comp[1] condition
 #' @param comp a vector of c('condition', 'condition1', 'condition2') in resultsNames(dds)
 #' @param annot path to a gene annotation file that will get merged with results
 #' @param padj_cutoff float, a cutoff for adjusted p.value
@@ -335,78 +449,87 @@ generate_DEseq <- function (my_data, groups) {
 #' @param nc_cutoff float, a cutoff for mean normalized counts
 #'
 #' @return NULL
-run_DE <- function(dds, 
+run_DE <- function(ddsobj, 
                    comp,
-                   annot="~/Data/Genomes/Human/biomart_dls/human_ensID_genename_240627.txt",
+                   compdir='.',
+                   annot=NULL,
                    padj_cutoff = 0.05,
                    logfc_cutoff = 1,
-                   nc_cutoff = 10) {
+                   nc_cutoff = 10,
+                   debug=F) {
   if (length(comp) != 3) {
     stop("comp must be length 3")
-  } else {
-    res <- results(dds, name = paste0(comp[1], "_",
-                                        comp[2], "_vs_",
-                                        comp[3])) %>%
-      data.frame(.) %>% 
-      rownames_to_column('Gene stable ID') %>% 
-      as_tibble()
   }
-   
-  # add the annotated gene names and descriptions 
-  transl.tab <- read_delim(annot,delim='\t')%>% 
-    dplyr::arrange("Gene stable ID")  
+  ddsobj@colData[[comp[1]]] <- droplevels(ddsobj@colData[[comp[1]]])
+  if (length(levels(ddsobj@colData[[comp[1]]])) != 2) {
+    stop("must only have 2 factor levels in levels(dds@colData[[comp[1]]])")
+  }
+  
+  # import ensembl_ids
+  if (is.null(annot)) {
+    mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+    annot <- getBM(filters = "ensembl_gene_id", 
+                     attributes = c("ensembl_gene_id", "hgnc_symbol", 
+                                    "description", "gene_biotype"),
+                     values = rownames(counts), 
+                     mart = mart)
+  } 
+  
+  comparison = paste0(comp[1], "_",
+                      levels(ddsobj@colData[[comp[1]]])[2], "_vs_",
+                      levels(ddsobj@colData[[comp[1]]])[1])
+  # get the right order because name is based on factor level
+  res <- results(ddsobj, name = comparison) %>%
+    data.frame(.) %>% 
+    rownames_to_column('ensembl_gene_id') %>% 
+    as_tibble()  
   
   # create the normalized counts table
-  nc <- as.data.frame(DESeq2::counts(dds, normalized=T))
+  nc <- as.data.frame(DESeq2::counts(ddsobj, normalized=T))
   nc$mean_norm_counts <- rowMeans(nc) 
   nc <- nc %>% 
-    rownames_to_column('Gene stable ID')
+    rownames_to_column('ensembl_gene_id')
   
   # join everything 
-  res.gn <- transl.tab %>%
-    left_join(res, by='Gene stable ID') %>%
+  res.gn <- annot %>%
+    left_join(res, by='ensembl_gene_id') %>%
     filter(!is.na(log2FoldChange)) %>% 
-    select(c("Gene stable ID", 
-             "Gene name", 
-             "Gene description", 
-             'Gene type',
+    dplyr::select(c("ensembl_gene_id", 
+             "hgnc_symbol", 
+             "description", 
+             'gene_biotype',
              'log2FoldChange',
+             'stat', # will be used now as the ranking metric for GSEA
              'pvalue',
              'padj')) %>% 
-    left_join(nc, by='Gene stable ID')
+    left_join(nc, by='ensembl_gene_id')
   
   # extract DE genes
   de_genes_fdr <- res.gn %>%
-    filter(padj < padj_cutoff) %>%
+    filter(padj < padj_cutoff)
   de_genes_log2f <- de_genes_fdr %>%
     filter(log2FoldChange > logfc_cutoff)
   de_genes_nc <- de_genes_log2f %>%
     filter(mean_norm_counts > nc_cutoff)
   rnk_all <- res.gn %>%
-    filter(`Gene type` == 'protein_coding') %>%
-    select(c("Gene name", "log2FoldChange")) %>%
-    arrange(desc(log2FoldChange))
+    filter(gene_biotype == 'protein_coding') %>%
+    dplyr::select(c("hgnc_symbol", "stat")) %>%
+    arrange(desc(stat))
   rnk_sig <- de_genes_fdr %>%
-    filter(`Gene type` == 'protein_coding') %>%
-    select(c("Gene name", "log2FoldChange")) %>%
-    arrange(desc(log2FoldChange))
+    filter(gene_biotype == 'protein_coding') %>%
+    dplyr::select(c("hgnc_symbol", "stat")) %>%
+    arrange(desc(stat))
   
   # write output to files
-  compdir <- paste0("DEG_", comp[1], '_', comp[2], "_vs_", comp[3])
+  outdir <- file.path(compdir, paste0("DEG_", comparison))
   dir.create(compdir)
-  write_delim(de_genes_fdr, file = file.path(compdir, paste0(comp[1], '_', comp[2], 
-                                          "_vs_", comp[3], "_fdrgenes.csv")))
-  write_delim(de_genes_log2f, file = file.path(compdir, paste0(comp[1], '_', comp[2], 
-                                            "_vs_", comp[3], "_log2f.csv")))
-  write_delim(de_genes_nc, file = file.path(paste0(comp[1], '_', comp[2], 
-                                         "_vs_", comp[3], "_normcounts_cutoff.csv")))
-  write_delim(res.gn, file = file.path(paste0(comp[1], '_', comp[2], 
-                                    "_vs_", comp[3], "_allgenes.csv")))
-  write.table(rnk_all, file = file.path(paste0(comp[1], '_', comp[2], 
-                                     "_vs_", comp[3], "_rank_all.rnk")), 
+  write_delim(de_genes_fdr, file = file.path(compdir, paste0(comparison, "_fdrgenes.tsv")),delim='\t')
+  write_delim(de_genes_log2f, file = file.path(compdir, paste0(comparison, "_log2f.tsv")),delim='\t')
+  write_delim(de_genes_nc, file = file.path(compdir, paste0(comparison, "_normcounts_cutoff.tsv")),delim='\t')
+  write_delim(res.gn, file = file.path(compdir, paste0(comparison, "_allgenes.tsv")),delim='\t')
+  write.table(rnk_all, file = file.path(compdir, paste0(comparison, "_rank_all.rnk")), 
               sep = "\t", row.names = F, quote = F)
-  write.table(rnk_sig, file = file.path(paste0(comp[1], '_', comp[2], 
-                                     "_vs_", comp[3], "_rank_sig.rnk")), 
+  write.table(rnk_sig, file = file.path(compdir, paste0(comparison, "_rank_sig.rnk")), 
               sep = "\t", row.names = F, quote = F)
   
   return(NULL)
@@ -438,11 +561,11 @@ gsea_analysis <- function(allgenes_path,
   }
   
   rnk <- read_delim(allgenes_path,delim='\t') %>%
-    filter(!is.na(`Gene name`))  %>%
+    filter(!is.na(hgnc_symbol))  %>%
     filter(!is.na(log2FoldChange)) %>%
-    filter(`Gene type` == 'protein_coding') %>%
+    filter(gene_biotype == 'protein_coding') %>%
     arrange(desc(log2FoldChange)) 
-  rnk <- rnk[!duplicated(rnk$`Gene name`),]
+  rnk <- rnk[!duplicated(rnk$hgnc_symbol),]
   rnk.up <- rnk %>%
     filter(log2FoldChange > 0) %>%
     mutate(rank.up = rank(log2FoldChange, ties.method = "random"))
@@ -451,18 +574,18 @@ gsea_analysis <- function(allgenes_path,
     mutate(rank.dn = -(rank(desc(log2FoldChange), ties.method = 'random')))
   
   rnk.up.v <- setNames(rnk.up$rank.up, 
-                       nm=rnk.up$`Gene name`) 
+                       nm=rnk.up$hgnc_symbol) 
   rnk.dn.v <- setNames(-(rnk.dn$rank.dn), 
-                       nm=rnk.dn$`Gene name`) 
+                       nm=rnk.dn$hgnc_symbol) 
   rnk.v <- setNames(rnk$log2FoldChange, 
-                    nm=rnk$`Gene name`)
+                    nm=rnk$hgnc_symbol)
   
   # output rank files 
-  write.table(rnk[,c('Gene name', "log2FoldChange")], file.path(analysisdir,'ALL','input_ALL.rnk.txt'),
+  write.table(rnk[,c('hgnc_symbol', "log2FoldChange")], file.path(analysisdir,'ALL','input_ALL.rnk.txt'),
               quote=F,sep='\t',col.names = NA)
-  write.table(rnk.up[,c('Gene name', "rank.up")], file.path(analysisdir,'UP','input_UP.rnk.txt'),
+  write.table(rnk.up[,c('hgnc_symbol', "rank.up")], file.path(analysisdir,'UP','input_UP.rnk.txt'),
               quote=F,sep='\t',col.names = NA)
-  write.table(rnk.dn[,c('Gene name', "rank.dn")], file.path(analysisdir,'DOWN','input_DOWN.rnk.txt'),
+  write.table(rnk.dn[,c('hgnc_symbol', "rank.dn")], file.path(analysisdir,'DOWN','input_DOWN.rnk.txt'),
               quote=F,sep='\t',col.names = NA)
   
   # Create Tables First ...
@@ -520,53 +643,6 @@ gsea_analysis <- function(allgenes_path,
 }
 
 
-
-# old run_DE function
-run_DE_old <- function (dds, 
-                    comparisons, 
-                    coi) {
-  i <- comparisons
-
-  raw_counts <- counts(dds, normalized = F)
-  cpms <- as_tibble(rowMeans(cpm(raw_counts)))
-  cpms <- cbind(rownames(raw_counts), cpms)
-  colnames(cpms) <- c("ensembl", "cpm")
-
-  res <- results(dds, contrast = c(coi, i[1], i[2]))[,-c(3,4)]
-  res <- apply_annotation(res, annotation, cpms,
-                          joinCPMcol1 = "Row.names",
-                          joinCPMcol2 = "row.names")
-
-  # extract DE genes
-  de_genes_fdr <- sort_genes_fdr(res, fdrcutoff)
-  de_genes_rawp <- sort_genes_rawp(res, rawpcutoff)
-  de_genes_log2f <- sort_genes_log2f(res, fdrcutoff, log2cutoff)
-  de_genes_cpm <- sort_genes_cpm(res, fdrcutoff, log2cutoff, cpmcutoff)
-
-  # combine normalized counts with entire DE list
-  normalized_counts <- round(counts(dds, normalized = TRUE),3)
-  pattern <- str_c(i[1], "|", i[2])
-  combined_data <- as_tibble(cbind(res, normalized_counts[,grep(pattern, colnames(normalized_counts))] ))
-  combined_data <- combined_data[order(combined_data$log2FoldChange, decreasing = T),]
-
-  # make ordered rank file for GSEA, selecting only protein coding genes
-  res_prot <- res[which(res$Gene.type == "protein_coding"),]
-  resOrdered <- res_prot[order(res_prot$log2FoldChange, decreasing = T),c("Gene.name", "log2FoldChange", "padj")]
-  resOrdered <- na.omit(resOrdered)
-  resOrdered$Gene.name <- str_to_upper(resOrdered$Gene.name)
-  resOrdered <- resOrdered[,-3]
-
-  # write output to files
-  write.csv (de_genes_fdr, file = paste0(i[1], "_vs_", i[2], "_fdrgenes.csv"))
-  write.csv (de_genes_rawp, file = paste0(i[1], "_vs_", i[2], "_rawpgenes.csv"))
-  write.csv (de_genes_log2f, file = paste0(i[1], "_vs_", i[2], "_log2f.csv"))
-  write.csv (de_genes_cpm, file = paste0(i[1], "_vs_", i[2], "_cpm_cutoff.csv"))
-  write.csv (combined_data, file = paste0(i[1], "_vs_", i[2], "_allgenes.csv"))
-  write.table (resOrdered, file = paste0(i[1], "_vs_", i[2], "_rank.rnk"), sep = "\t", row.names = F, quote = F)
-  return ( c(nrow(de_genes_rawp), nrow(de_genes_fdr), nrow(de_genes_log2f), nrow(de_genes_cpm)))
-}
-
-
 #' plot_volcano
 #' @description Prints a ggplot2 volcano plot for allgenes data
 #' @param file The allgenes.csv file generated from deseq2 de results being used to make the figure
@@ -574,34 +650,28 @@ run_DE_old <- function (dds,
 #' @param labels The concatenated list of labels to label on the figure
 #' @param p_opts plot options, a ggplot2 layer which will be added to the plot before printing at the end
 #' @return
-plot_volcano <- function(file, withlabels=T, labels=NULL, noOthers=F, p_opts=NULL) {
-  if (grepl("allgenes.csv",file)) {
-    name <- gsub(".*/|_allgenes.csv", "", file)
-    # name_num <- strsplit(name, "_vs_")[[1]][1]
-    # name_den <- strsplit(name, "_vs_")[[1]][2]
-    comp <- read.csv(file, header=T)
-  } else if (grepl("*.tsv", file)) {
-    name <- gsub(".*/|\\.*", "",file)
-    comp <- read_delim(file, delim = "\t")
-  }
+plot_volcano <- function(file, withlabels=T, labels=NULL, noOthers=F, p_opts=NULL,fdrcutoff=0.05) {
+  library(ggrepel)
+  name <- gsub(".*/|_allgenes.tsv", "", file)
+  comp <- read_delim(file,delim='\t')
   
-  comp <- comp %>%
-    select(c( "Gene name", "log2FoldChange", "padj"))
+  comp <- comp %>% as.data.frame() %>%
+    dplyr::select(c( "hgnc_symbol", "log2FoldChange", "padj"))
   comp$log10fdr <- -log10(comp$padj)
   comp$fdrpass <- ifelse(comp$padj < fdrcutoff, "passing FDR", "not passing")
   comp$l2fcdir <- ifelse(comp$log2FoldChange > 0, "l2fc+", "l2fc-")
   comp$fdr_l2fc_color <- paste0(comp$fdrpass, " and ", comp$l2fcdir)
   comp$distfromorigin <- NA
-  select <- which(!is.na(comp$log2FoldChange) & !is.na(comp$log10fdr))
-  comp$distfromorigin[select] <- sqrt((comp$log10fdr[select])^2 + (comp$log2FoldChange[select])^2 )
+  slct <- which(!is.na(comp$log2FoldChange) & !is.na(comp$log10fdr))
+  comp$distfromorigin[slct] <- sqrt((comp$log10fdr[slct])^2 + (comp$log2FoldChange[slct])^2 )
   dist_cutoff_high <- tail(head(sort(comp$distfromorigin[!is.na(comp$distfromorigin)], decreasing = T), n=10), n=1)
   if (withlabels && !is.null(labels)) {
     comp$label <- NA
-    comp$label[which(comp$`Gene name` %in% labels)] <- comp$Gene.name[which(comp$`Gene name` %in% labels)]
+    comp$label[which(comp$hgnc_symbol %in% labels)] <- comp$hgnc_symbol[which(comp$hgnc_symbol %in% labels)]
   } else if (withlabels && is.null(labels)) {
     comp$label <- NA
     comp$label[which(comp$distfromorigin >= dist_cutoff_high)] <-
-      comp$`Gene name`[which(comp$distfromorigin >= dist_cutoff_high)]
+      comp$hgnc_symbol[which(comp$distfromorigin >= dist_cutoff_high)]
   }
   decolors <- c(rep("#000000", 5), "#ff595e", "#1982c4")
   names(decolors) <- c("NA and l2fc+", "NA and l2fc-",
@@ -617,10 +687,10 @@ plot_volcano <- function(file, withlabels=T, labels=NULL, noOthers=F, p_opts=NUL
     geom_vline(xintercept = 0, color="gray") +
     geom_point() +
     scale_color_manual(values=decolors) +
-    labs(title=paste0(name)) + 
-    theme(axis.line.x = element_line(color="black"),
-          axis.line.y = element_line(color="black"),
-          panel.background = element_rect(color="black", fill = "white"))
+    labs(title=paste0(name),
+         x = "Log2(Fold Change)",
+         y = "-Log10(FDR)") + 
+    theme_bw()
   if (withlabels) {
     p <- p + geom_text_repel(aes(label=label),size= 2.5, color="black",
                              segment.size = 0.5,point.padding = 0.2,
@@ -1056,6 +1126,14 @@ norm_ratio_sig <- function(gene_list1, gene_list2, cpm_temp) {
   return(mysig)
 }
 
+
+########################
+######### GSEA #########
+########################
+# insert new GSEA function here 
+
+
+# unused 260226
 # GSEA ----
 processed_ranks <- function(rank) {
   if (class(rank$log2FoldChange) != "numeric") { #if the log2FoldChange is no numeric- makes it numeric
@@ -1077,11 +1155,13 @@ processed_ranks <- function(rank) {
   rank
 }
 
+# unused 260226
 # for inputting plotenrichment easier
 plot.enrichment <- function (geneset, pathway, ranked_list) {
   plotEnrichment(geneset[[pathway]], ranked_list)+labs (title = pathway)
 }
 
+# unused 260226
 #ranks <- tibble::deframe(ranks)
 fgsea_object <- function(mypathway, rank, write_table = F, minSize=15) { #creates the fgsea object
   fgsea_obj <- fgsea(pathways = mypathway,
@@ -1091,7 +1171,7 @@ fgsea_object <- function(mypathway, rank, write_table = F, minSize=15) { #create
                      nperm= 1000)
 
 }
-
+# unused 260226
 signif_barplot <- function(fgseas_obj, mytitle,p_val=0.05) {
   fgseas_obj$pathway <- gsub("^[^_]*_*", "\\1", fgseas_obj$pathway) #removes up to and including the first underscore of each pathway
   fgseaRes_tidy <- fgseas_obj %>% as_tibble() %>% arrange(desc(NES))
@@ -1102,6 +1182,7 @@ signif_barplot <- function(fgseas_obj, mytitle,p_val=0.05) {
     scale_fill_discrete(name = paste0("padj <", p_val))
 }
 
+# unused 260226
 fgsea_barplot_hallmark <- function(rankfile_loc,
                                    hallmark.pathway=hallmark.pathway,
                                    GO.pathway=GO.pathway,
@@ -1119,6 +1200,7 @@ fgsea_barplot_hallmark <- function(rankfile_loc,
 }
 
 # it just does it all.
+# # unused 260226
 entire_fgsea_analysis <- function(folder, rawpcutoff=0.05, pathways = "both",
                                   pattern=NULL, alt_pathways=NULL,output=NULL) {
   if (is.null(output)) {
@@ -1294,7 +1376,7 @@ closest_interaction <- function(gene1, gene2, db, debug=F) {
 }
 
 
-# 
+# unused 260226
 output_de_tables <- function(res, annotation,cpms, outdir,name) {
   
   res <- apply_annotation(res, annotation, cpms,

@@ -23,6 +23,9 @@ def main():
 
     # go through alignments tab and collect all files which will be read from
     alignfolder = sys.argv[1]
+    
+    print(f"Processing STAR alignments in <{alignfolder}> with strandedness <reverse>...")
+
     if not os.path.exists(alignfolder):
         raise OSError("Align folder doesn't exist.")
         
